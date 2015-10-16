@@ -1,0 +1,83 @@
+---
+- hosts: all
+  vars:
+    home: "/home/deployer"
+    repo: "git@github.com:{{ repository_name }}.git"
+    bare: "{{ home }}/bare"
+    target: "{{ home }}/app"
+    shared_path: "{{ target }}/shared"
+    build_path: "{{ deployment.build_path }}"
+    releases_path: "{{ target }}/releases"
+    release_path: "{{ releases_path }}/{{ deployment.timestamp }}"
+    current_path: "{{ target }}/current"
+    directories:
+      - "{{ releases_path }}"
+      - "{{ shared_path }}"
+      - "{{ shared_path }}/config"
+      - "{{ shared_path }}/log"
+    symlinks:
+      - { src: "{{ shared_path }}/log", dest: "{{ build_path }}/log" }
+    leiningen_version: stable
+  tasks:
+    - name: install essentials
+      apt: pkg={{ item }} state=latest update_cache=yes
+      with_items:
+        - git
+        - python-software-properties
+    - name: add Oracle's Java PPA
+      apt_repository: repo='ppa:webupd8team/java'
+    - name: accept Oracle's license
+      shell: echo debconf shared/accepted-oracle-license-v1-1 select true | debconf-set-selections
+    - name: install Java 8
+      apt: pkg=oracle-java8-installer update_cache=yes state=installed
+    - name: set Java 8 JAVA_HOME environment variable
+      apt: pkg=oracle-java8-set-default state=latest
+    - name: download Leiningen
+      get_url:
+        url: https://raw.github.com/technomancy/leiningen/{{leiningen_version}}/bin/lein
+        dest: /usr/local/bin/lein-{{leiningen_version}}
+        mode: 0755
+    - name: link Leinigen
+      file:
+        dest: /usr/local/bin/lein
+        src: /usr/local/bin/lein-{{leiningen_version}}
+        state: link
+    - action: deployment_facts
+    - name: Provide default SSH config
+      template: src=ssh.conf dest=~/.ssh/config
+    - name: Add Nginx conf
+      template: src=nginx.conf dest=/etc/nginx/sites-enabled/app owner=root group=root
+      sudo: yes
+    - name: Reload Nginx conf
+      service: name=nginx state=reloaded
+      sudo: yes
+    - name: Setup directory structure
+      file: path={{ item }} state=directory
+      with_items: directories
+    - name: Add env.conf file
+      template: src=env.conf dest={{ shared_path }}/config/env
+    - name: source `env`
+      lineinfile:
+        dest: "~/.bashrc"
+        regexp: "^source"
+        insertafter: "^# for examples"
+        line: "source /home/deployer/app/shared/config/env"
+    - name: get/update bare repository
+      git: repo={{ repo }} dest={{ bare }} bare=yes update=yes accept_hostkey=yes
+    - shell: chdir={{ bare }} git archive master | tar -x -C {{ build_path }}
+    - name: symlink shared files to build directory
+      file: src={{ item.src }} dest={{ item.dest }} state=link force=yes
+      with_items: symlinks
+      when: item is defined
+    - name: make sure tmp/ exists
+      file: path={{ build_path }}/tmp state=directory
+    - name: move build to releases directory
+      shell: "mv {{ build_path }} {{ release_path }}"
+    - name: set current to the most recent release
+      file:
+        src: "{{ release_path }}"
+        dest: "{{ current_path }}"
+        state: "link"
+        force: "yes"
+    - name: keep only 5 releases
+      shell: ls -dt {{ releases_path }}/* | tail -n +6 | xargs rm -rf
